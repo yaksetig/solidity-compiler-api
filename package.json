@@ -1,0 +1,18 @@
+{
+  "name": "sol-compile-api",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "solc": "^0.8.26",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.1.0",
+    "body-parser": "^1.20.2",
+    "uuid": "^9.0.1"
+  }
+}
