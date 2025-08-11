@@ -9,21 +9,34 @@ import os from "os";
 import { v4 as uuidv4 } from "uuid";
 import solc from "solc";
 
-// ---------- Config ----------
+// ============================ Config ============================
 const PORT = process.env.PORT || 8080;
+
+// import graph limits
 const MAX_SOURCES = Number(process.env.MAX_SOURCES ?? 64);
 const MAX_TOTAL_BYTES = Number(process.env.MAX_TOTAL_BYTES ?? 1_500_000); // ~1.5MB
-const ALLOW_REDIRECTS = true; // for CDNs
-const DEFAULT_NPM_CDN = process.env.NPM_CDN ?? "https://unpkg.com"; // could be jsDelivr
 
-// ---------- App ----------
+// package/CDN config
+const DEFAULT_NPM_CDN = process.env.NPM_CDN ?? "https://unpkg.com";
+
+// security: only fetch from these hosts
+const ALLOWED_HOSTS = new Set([
+  "unpkg.com",
+  "raw.githubusercontent.com",
+  "githubusercontent.com"
+]);
+
+// solc versions index
+const SOLC_LIST_URL = "https://binaries.soliditylang.org/bin/list.json";
+
+// ============================ App ============================
 const app = express();
 app.use(helmet());
 app.use(morgan("tiny"));
 app.use(bodyParser.json({ limit: "512kb" }));
 app.use(rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false }));
 
-// ---------- Helpers ----------
+// ============================ Helpers ============================
 function buildStandardJson(sourcesMap, settings = {}) {
   return {
     language: "Solidity",
@@ -36,12 +49,34 @@ function buildStandardJson(sourcesMap, settings = {}) {
   };
 }
 
+function extractImportsWithRanges(sol) {
+  // captures import "X"; or import ... from "X";
+  const re = /import\s+(?:[^'"]*from\s+)?(['"])([^'"]+)\1\s*;/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(sol)) !== null) {
+    out.push({ start: m.index, end: re.lastIndex, spec: m[2] });
+  }
+  return out;
+}
+
 function isHttp(u) {
   return /^https?:\/\//i.test(u);
 }
 
+function hostFromUrl(u) {
+  try { return new URL(u).host; } catch { return ""; }
+}
+
+function assertAllowed(url) {
+  const host = hostFromUrl(url);
+  if (!ALLOWED_HOSTS.has(host)) {
+    throw new Error(`Disallowed host for imports: ${host}`);
+  }
+}
+
 function parseGithubShorthand(s) {
-  // github:owner/repo@ref/path/to/file.sol
+  // github:owner/repo@ref/path/to/file.sol  →  https://raw.githubusercontent.com/owner/repo/ref/path/to/file.sol
   const m = /^github:([^/]+)\/([^@]+)@([^/]+)\/(.+)$/.exec(s);
   if (!m) return null;
   const [, owner, repo, ref, filePath] = m;
@@ -49,9 +84,9 @@ function parseGithubShorthand(s) {
 }
 
 function parseNpmSpec(s, pkgVersions = {}) {
-  // Accept either:
+  // Accept:
   //  - npm:@scope/pkg@1.2.3/path/to/file.sol
-  //  - @scope/pkg/path/to/file.sol  (version pulled from pkgVersions map)
+  //  - @scope/pkg/path/to/file.sol  (version pulled from packageVersions map)
   if (s.startsWith("npm:")) {
     const body = s.slice(4);
     const m = /^(@?[^/@]+\/?[^@/]*)@([^/]+)\/(.+)$/.exec(body);
@@ -59,151 +94,173 @@ function parseNpmSpec(s, pkgVersions = {}) {
     const [, pkg, ver, rest] = m;
     return `${DEFAULT_NPM_CDN}/${pkg}@${ver}/${rest}`;
   }
-  // Bare package form requiring version mapping:
+  // Bare package path:
   if (/^@?[^./][^:]*\//.test(s)) {
-    // e.g., @openzeppelin/contracts/...
     const parts = s.split("/");
     const pkg = parts[0].startsWith("@") ? `${parts[0]}/${parts[1]}` : parts[0];
     const rest = parts[0].startsWith("@") ? parts.slice(2).join("/") : parts.slice(1).join("/");
     const ver = pkgVersions[pkg];
-    if (!ver) {
-      throw new Error(`Missing version for package "${pkg}". Provide "packageVersions": { "${pkg}": "<version>" }`);
-    }
+    if (!ver) throw new Error(`Missing version for package "${pkg}". Provide "packageVersions": { "${pkg}": "<version>" }`);
     return `${DEFAULT_NPM_CDN}/${pkg}@${ver}/${rest}`;
   }
   return null;
 }
 
 function resolveImportPath(raw, parentBase, pkgVersions) {
-  if (isHttp(raw)) return new URL(raw, parentBase || undefined).toString();
-
+  if (isHttp(raw)) {
+    const url = new URL(raw, parentBase || undefined).toString();
+    assertAllowed(url);
+    return url;
+  }
   if (raw.startsWith("github:")) {
     const u = parseGithubShorthand(raw);
     if (!u) throw new Error(`Invalid GitHub shorthand: ${raw}`);
+    assertAllowed(u);
     return u;
   }
-
   if (raw.startsWith("npm:") || /^[^./]/.test(raw)) {
     const u = parseNpmSpec(raw, pkgVersions);
-    if (u) return u;
+    if (u) {
+      assertAllowed(u);
+      return u;
+    }
   }
-
-  // Relative path
   if (raw.startsWith("./") || raw.startsWith("../")) {
     if (!parentBase) throw new Error(`Relative import "${raw}" has no base context`);
-    return new URL(raw, parentBase).toString();
+    const u = new URL(raw, parentBase).toString();
+    assertAllowed(u);
+    return u;
   }
-
   throw new Error(`Unsupported import path: ${raw}`);
 }
 
-function extractImports(sol) {
-  // Handles: import "x";  import * as Y from "x";  import {A as B} from "x";
-  const regex = /import\s+(?:[^'"]*from\s+)?["']([^"']+)["']\s*;/g;
-  const out = [];
-  let m;
-  while ((m = regex.exec(sol)) !== null) out.push(m[1]);
-  return out;
-}
-
-async function fetchText(url) {
-  const res = await fetch(url, { redirect: ALLOW_REDIRECTS ? "follow" : "manual" });
+async function fetchText(url, cache) {
+  if (cache.has(url)) return cache.get(url);
+  const res = await fetch(url, { redirect: "follow" });
   if (!res.ok) throw new Error(`Fetch failed ${res.status} for ${url}`);
-  return await res.text();
-}
-
-function keyFromUrl(url) {
-  // a stable key for sources map; use the full URL string
-  return url;
+  const txt = await res.text();
+  cache.set(url, txt);
+  return txt;
 }
 
 async function resolveAllSources(entryContent, entryKey, options) {
   const { packageVersions = {}, maxSources = MAX_SOURCES, maxBytes = MAX_TOTAL_BYTES } = options || {};
-  const sources = new Map(); // key -> { content, baseUrl? }
+
+  // key -> { content, baseUrl, children: Map<origSpec, resolvedKey> }
+  const nodes = new Map();
   const queue = [];
-  let totalBytes = 0;
+  const cache = new Map(); // url -> text (per request)
 
-  sources.set(entryKey, { content: entryContent, baseUrl: null });
-  queue.push({ key: entryKey, baseUrl: null, content: entryContent });
-
-  const visited = new Set([entryKey]);
+  let totalBytes = Buffer.byteLength(entryContent, "utf8");
+  nodes.set(entryKey, { content: entryContent, baseUrl: null, children: new Map() });
+  queue.push(entryKey);
 
   while (queue.length) {
-    if (sources.size > maxSources) throw new Error(`Too many source files (> ${maxSources})`);
-    const { key, baseUrl, content } = queue.shift();
-    const imps = extractImports(content);
+    if (nodes.size > maxSources) throw new Error(`Too many source files (> ${maxSources})`);
 
+    const key = queue.shift();
+    const node = nodes.get(key);
+    const { content, baseUrl } = node;
+
+    const imps = extractImportsWithRanges(content);
     for (const imp of imps) {
-      let resolvedUrl;
-      try {
-        resolvedUrl = resolveImportPath(imp, baseUrl, packageVersions);
-      } catch (e) {
-        throw new Error(`Import resolution error for "${imp}" in "${key}": ${e.message}`);
+      const resolved = resolveImportPath(imp.spec, baseUrl, packageVersions); // absolute URL
+      const childKey = resolved; // canonical key for solc
+      node.children.set(imp.spec, childKey);
+
+      if (!nodes.has(childKey)) {
+        const childText = await fetchText(resolved, cache);
+        totalBytes += Buffer.byteLength(childText, "utf8");
+        if (totalBytes > maxBytes) throw new Error(`Total import size exceeded (${maxBytes} bytes)`);
+        nodes.set(childKey, { content: childText, baseUrl: resolved, children: new Map() });
+        queue.push(childKey);
       }
-      const childKey = keyFromUrl(resolvedUrl);
-      if (visited.has(childKey)) continue;
-      visited.add(childKey);
-
-      const childText = await fetchText(resolvedUrl);
-      totalBytes += Buffer.byteLength(childText, "utf8");
-      if (totalBytes > maxBytes) throw new Error(`Total import size exceeded (${maxBytes} bytes)`);
-
-      sources.set(childKey, { content: childText, baseUrl: new URL(resolvedUrl).toString() });
-      queue.push({ key: childKey, baseUrl: resolvedUrl, content: childText });
-
-      if (sources.size > maxSources) throw new Error(`Too many source files (> ${maxSources})`);
+      if (nodes.size > maxSources) throw new Error(`Too many source files (> ${maxSources})`);
     }
   }
 
-  // Convert to standard-json "sources" map
+  // Rewrite imports so specifiers match canonical child keys
   const stdSources = {};
-  for (const [k, v] of sources.entries()) stdSources[k] = { content: v.content };
+  for (const [key, node] of nodes.entries()) {
+    let text = node.content;
+    const imps = extractImportsWithRanges(text).reverse(); // replace from end to start
+    for (const imp of imps) {
+      const resolvedKey = node.children.get(imp.spec);
+      if (!resolvedKey) continue;
+      const original = text.slice(imp.start, imp.end);
+      const replaced = original.replace(imp.spec, resolvedKey);
+      text = text.slice(0, imp.start) + replaced + text.slice(imp.end);
+    }
+    stdSources[key] = { content: text };
+  }
+
   return stdSources;
 }
 
-// ---------- API ----------
+// ----- compiler version helpers -----
+async function resolveFullSolcTag(ver) {
+  // Accepts "0.8.26" or "v0.8.26" and returns "v0.8.26+commit.<hash>"
+  const semver = ver.replace(/^v/i, "");
+  const res = await fetch(SOLC_LIST_URL, { redirect: "follow" });
+  if (!res.ok) throw new Error(`Failed to fetch solc versions list: ${res.status}`);
+  const data = await res.json();
+  const fname = data.releases[semver];
+  if (!fname) throw new Error(`Compiler version ${semver} not found in releases`);
+  const m = fname.match(/^soljson-(v\d+\.\d+\.\d+\+commit\.[0-9a-f]+)\.js$/i);
+  if (!m) throw new Error(`Unexpected filename format for ${fname}`);
+  return m[1];
+}
+
+async function loadCompiler(compilerVersion) {
+  // No version: use bundled solc
+  if (!compilerVersion) return solc;
+
+  let tag = compilerVersion;
+  if (/^\d+\.\d+\.\d+$/.test(compilerVersion) || /^v?\d+\.\d+\.\d+$/.test(compilerVersion)) {
+    tag = await resolveFullSolcTag(compilerVersion);
+  } else if (!/^v?\d+\.\d+\.\d+\+commit\.[0-9a-f]+$/i.test(compilerVersion)) {
+    throw new Error(`Unsupported compilerVersion format: ${compilerVersion}`);
+  }
+  if (!tag.startsWith("v")) tag = `v${tag}`;
+
+  return await new Promise((resolve, reject) => {
+    solc.loadRemoteVersion(tag, (err, s) => (err ? reject(err) : resolve(s)));
+  });
+}
+
+// ============================ API ============================
 app.post("/compile", async (req, res) => {
   try {
     const {
       source,
       filename,
-      compilerVersion,      // e.g., "0.8.26"
+      compilerVersion,     // optional
       returnArtifacts,
-      packageVersions,      // e.g., { "@openzeppelin/contracts": "5.0.2" }
-      settings              // optional solc settings override
+      packageVersions,     // e.g., { "@openzeppelin/contracts": "5.0.2" }
+      settings             // optional solc settings override
     } = req.body || {};
 
     if (typeof source !== "string" || !source.trim()) {
       return res.status(400).json({ success: false, error: "Missing 'source' string." });
     }
 
+    // 1) write temp .sol (your constraint)
     const safeName =
       (filename && filename.replace(/[^a-zA-Z0-9_.-]/g, "")) || `Contract_${uuidv4().slice(0, 8)}.sol`;
-
-    // 1) Write a temp .sol file (your hard requirement)
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "solc-"));
     const filePath = path.join(tmpDir, safeName);
     await fs.writeFile(filePath, source, "utf8");
 
-    // 2) Resolve imports recursively and build sources
-    //    The entry key is the local filename; relative imports inside the entry are not allowed
-    //    unless you also provide a base (use absolute URLs or npm/github shorthands).
+    // 2) resolve + rewrite imports; entry key is the filename you provided
     const sourcesMap = await resolveAllSources(source, safeName, { packageVersions });
 
-    // 3) Build standard JSON
+    // 3) build standard json
     const input = buildStandardJson(sourcesMap, settings);
 
-    // 4) Pick compiler version
-    let compiler = solc;
-    if (compilerVersion && /^v?\d+\.\d+\.\d+/.test(compilerVersion)) {
-      const ver = compilerVersion.startsWith("v") ? compilerVersion : `v${compilerVersion}`;
-      const load = await new Promise((resolve, reject) => {
-        solc.loadRemoteVersion(ver, (err, solcSpecific) => (err ? reject(err) : resolve(solcSpecific)));
-      });
-      compiler = load;
-    }
+    // 4) pick compiler
+    const compiler = await loadCompiler(compilerVersion);
 
-    // 5) Compile (no import callback needed)
+    // 5) compile (no import callback)
     const outputJSON = compiler.compile(JSON.stringify(input));
     const output = JSON.parse(outputJSON);
 
@@ -238,8 +295,8 @@ app.post("/compile", async (req, res) => {
       base.artifacts = artifacts;
     }
 
-    // Cleanup best-effort
-    try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    // cleanup best-effort
+    try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
 
     res.status(200).json(base);
   } catch (err) {
