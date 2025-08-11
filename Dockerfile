@@ -1,12 +1,16 @@
-# Use a slim Node image to keep Railway costs/boot times low
 FROM node:20-slim
 
-# Create app dir
 WORKDIR /app
 
-# Install deps first (better layer caching)
+# Copy manifest(s) first for layer caching
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
+
+# Install deps (tolerant if no lockfile present)
+RUN if [ -f package-lock.json ]; then \
+      npm ci --omit=dev --no-audit --no-fund; \
+    else \
+      npm install --omit=dev --no-audit --no-fund; \
+    fi
 
 # Copy source
 COPY src ./src
