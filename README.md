@@ -1,5 +1,3 @@
-# solidity-compiler-api
-
 # Solidity Compile API (Railway)
 
 ## Endpoints
