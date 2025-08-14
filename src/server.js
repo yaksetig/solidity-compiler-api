@@ -32,6 +32,15 @@ const SOLC_LIST_URL = "https://binaries.soliditylang.org/bin/list.json";
 // ============================ App ============================
 const app = express();
 app.use(helmet());
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
 app.use(morgan("tiny"));
 app.use(bodyParser.json({ limit: "512kb" }));
 app.use(rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false }));
